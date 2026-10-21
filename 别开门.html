@@ -998,6 +998,7 @@ const sttSupported = !!SR;
 /* ---------- 本地 ASR（离线课堂 / 任意浏览器：录音 → 本地服务识别） ---------- */
 let localASR = null;          // null=未探测，true/false=结果
 let mr = null, mrChunks = [], mrActive = false, mrTimer = null, mrCtx = null;
+let micBusy = false;          // getUserMedia 进行中防抖锁
 
 async function probeLocalASR(){
   if(localASR !== null) return localASR;
@@ -1039,8 +1040,11 @@ function wavFromAudioBuffer(buf, targetRate){
 }
 
 function startLocalRec(){
+  if(micBusy) return;                       // 防抖：getUserMedia 还没出结果
+  micBusy = true;
   stopAudio();
   pendingText = '';
+  statusLine.textContent = '正在准备麦克风…';
   if(mrCtx === null){
     try{ mrCtx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){}
   }
@@ -1076,16 +1080,32 @@ function startLocalRec(){
     mr.start();
     mrActive = true;
     recogActive = true;
+    micBusy = false;
     setState(AppState.LISTENING);
-    statusLine.textContent = '正在听……说完再点一次「停止」';
+    statusLine.textContent = '正在听……说完再点一下麦克风结束';
     updateMic();
     clearTimeout(mrTimer);
-    mrTimer = setTimeout(() => { if(mrActive) stopLocalRec(); }, 8000);
-  }).catch(() => {
-    showAlert('麦克风被拒绝：点地址栏右侧的麦克风图标允许后重试', 'error');
+    mrTimer = setTimeout(() => {
+      if(mrActive){
+        statusLine.textContent = '说话时间到，自动结束录音并识别…';
+        stopLocalRec();
+      }
+    }, 15000);
+  }).catch(err => {
+    micBusy = false;
     recogActive = false;
     setState(AppState.LISTENING);
     updateMic();
+    const n = (err && err.name) || '';
+    if(n === 'NotAllowedError' || n === 'PermissionDeniedError'){
+      showAlert('麦克风权限被拒绝：请点地址栏右侧的麦克风图标→改为「允许」，然后刷新页面重试', 'error');
+    }else if(n === 'NotFoundError' || n === 'DevicesNotFoundError'){
+      showAlert('没有检测到麦克风设备，请检查耳机 / 麦克风是否插好', 'error');
+    }else if(n === 'NotReadableError' || n === 'TrackStartError'){
+      showAlert('麦克风正被其他程序占用（如微信、会议软件），关掉它们再试', 'error');
+    }else{
+      showAlert('麦克风启动失败（' + (n || err) + '）：请检查 Windows「设置→隐私→麦克风」是否允许应用使用', 'error');
+    }
   });
 }
 
@@ -1097,6 +1117,7 @@ function stopLocalRec(){
 
 function startListening(){
   if(ended) return;
+  if(micBusy) return;                       // 防抖：getUserMedia 进行中
 
   // ① 环境前置判断：缺什么就直接说清楚
   if(!ENV.secure){
@@ -1113,22 +1134,14 @@ function startListening(){
   }
 
   // ② 本地识别服务优先（本页通过 http://127.0.0.1:8000 打开时 /asr 可用）
-  if(probeLocalASR() !== false){
-    probeLocalASR().then(ok => {
-      if(ok){ startLocalRec(); }
-      else if(!sttSupported){
-        showAlert('本地识别服务不可用，当前浏览器也不支持语音识别，请直接打字回答', 'error');
-      } else {
-        legacyStartListening();
-      }
-    });
-    return;
-  }
-  if(!sttSupported){
-    showAlert('当前浏览器不支持语音识别（SpeechRecognition），请用 Chrome / Edge，或直接打字回答', 'error');
-    return;
-  }
-  legacyStartListening();
+  probeLocalASR().then(ok => {
+    if(ok){ startLocalRec(); }
+    else if(!sttSupported){
+      showAlert('本地识别服务不可用，当前浏览器也不支持语音识别，请直接打字回答', 'error');
+    } else {
+      legacyStartListening();
+    }
+  });
 }
 
 /* 浏览器 SpeechRecognition 回退路径（线上 / 无本地服务时使用） */
@@ -1214,8 +1227,9 @@ function stopListening(){
 }
 
 micBtn.addEventListener('click', () => {
-  if(recogActive){ stopListening(); return; }
-  if(mrActive){ stopLocalRec(); return; }
+  if(micBusy){ showAlert('正在准备麦克风，稍等片刻', 'info'); return; }
+  if(mrActive){ stopLocalRec(); return; }        // 录音中 → 结束录音并识别
+  if(recogActive){ showAlert('正在识别刚才的话，稍等片刻', 'info'); return; }  // 识别中 → 别吞点击
   if(ended){
     showAlert('本轮已经结束，点「换一位敲门人」或「再练一次」继续', 'info');
     return;

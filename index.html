@@ -995,16 +995,112 @@ function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const sttSupported = !!SR;
 
+/* ---------- 本地 ASR（离线课堂 / 任意浏览器：录音 → 本地服务识别） ---------- */
+let localASR = null;          // null=未探测，true/false=结果
+let mr = null, mrChunks = [], mrActive = false, mrTimer = null, mrCtx = null;
+
+async function probeLocalASR(){
+  if(localASR !== null) return localASR;
+  try{
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
+    const r = await fetch('asr?h=1', { cache: 'no-store', signal: ctrl.signal });
+    clearTimeout(t);
+    localASR = !!(r && r.ok);
+  }catch(e){ localASR = false; }
+  return localASR;
+}
+
+/* AudioBuffer（任意采样率）→ 16k 单声道 16bit PCM wav */
+function wavFromAudioBuffer(buf, targetRate){
+  const srcRate = buf.sampleRate;
+  const ch = buf.getChannelData(0);
+  const len = Math.max(0, Math.round(ch.length * targetRate / srcRate));
+  const out = new Float32Array(len);
+  for(let i = 0; i < len; i++){
+    const s = i * srcRate / targetRate;
+    const i0 = Math.floor(s), i1 = Math.min(i0 + 1, ch.length - 1);
+    const f = s - i0;
+    out[i] = ch[i0] * (1 - f) + ch[i1] * f;
+  }
+  const bytes = new DataView(new ArrayBuffer(44 + out.length * 2));
+  const wStr = (o, s) => { for(let i = 0; i < s.length; i++) bytes.setUint8(o + i, s.charCodeAt(i)); };
+  wStr(0, 'RIFF'); bytes.setUint32(4, 36 + out.length * 2, true); wStr(8, 'WAVE');
+  wStr(12, 'fmt '); bytes.setUint32(16, 16, true); bytes.setUint16(20, 1, true);
+  bytes.setUint16(22, 1, true); bytes.setUint32(24, targetRate, true);
+  bytes.setUint32(28, targetRate * 2, true); bytes.setUint16(32, 2, true);
+  bytes.setUint16(34, 16, true); wStr(36, 'data');
+  bytes.setUint32(40, out.length * 2, true);
+  for(let i = 0; i < out.length; i++){
+    const v = Math.max(-1, Math.min(1, out[i]));
+    bytes.setInt16(44 + i * 2, v < 0 ? v * 32768 : v * 32767, true);
+  }
+  return new Blob([bytes], { type: 'audio/wav' });
+}
+
+function startLocalRec(){
+  stopAudio();
+  pendingText = '';
+  if(mrCtx === null){
+    try{ mrCtx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){}
+  }
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+    mrChunks = [];
+    mr = new MediaRecorder(stream);
+    mr.ondataavailable = e => { if(e.data && e.data.size) mrChunks.push(e.data); };
+    mr.onstop = async () => {
+      const blob = new Blob(mrChunks, { type: mr.mimeType || 'audio/webm' });
+      stream.getTracks().forEach(t => t.stop());
+      statusLine.textContent = '识别中…';
+      try{
+        const ab = await blob.arrayBuffer();
+        const buf = await mrCtx.decodeAudioData(ab);
+        const wav = wavFromAudioBuffer(buf, 16000);
+        const resp = await fetch('asr', {
+          method: 'POST', body: wav,
+          headers: { 'Content-Type': 'audio/wav' }
+        });
+        const j = await resp.json();
+        const t = (j && j.text || '').trim();
+        if(t) handleUserInput(t);
+        else statusLine.textContent = '没听清，再说一次吧';
+      }catch(err){
+        console.warn('[本地识别失败]', err);
+        statusLine.textContent = '识别失败，请重试或打字回答';
+      }finally{
+        recogActive = false;
+        setState(AppState.LISTENING);
+        updateMic();
+      }
+    };
+    mr.start();
+    mrActive = true;
+    recogActive = true;
+    setState(AppState.LISTENING);
+    statusLine.textContent = '正在听……说完再点一次「停止」';
+    updateMic();
+    clearTimeout(mrTimer);
+    mrTimer = setTimeout(() => { if(mrActive) stopLocalRec(); }, 8000);
+  }).catch(() => {
+    showAlert('麦克风被拒绝：点地址栏右侧的麦克风图标允许后重试', 'error');
+    recogActive = false;
+    setState(AppState.LISTENING);
+    updateMic();
+  });
+}
+
+function stopLocalRec(){
+  mrActive = false;
+  clearTimeout(mrTimer);
+  if(mr && mr.state !== 'inactive'){ try{ mr.stop(); }catch(e){} }
+}
+
 function startListening(){
   if(ended) return;
 
   // ① 环境前置判断：缺什么就直接说清楚
   if(!ENV.secure){
     showAlert('当前不是 https / localhost，Chrome 会禁用麦克风，请改用 http://127.0.0.1:8000/', 'error');
-    return;
-  }
-  if(!sttSupported){
-    showAlert('当前浏览器不支持语音识别（SpeechRecognition），请用 Chrome / Edge，或直接打字回答', 'error');
     return;
   }
   if(!navigator.mediaDevices){
@@ -1016,6 +1112,27 @@ function startListening(){
     return;
   }
 
+  // ② 本地识别服务优先（本页通过 http://127.0.0.1:8000 打开时 /asr 可用）
+  if(probeLocalASR() !== false){
+    probeLocalASR().then(ok => {
+      if(ok){ startLocalRec(); }
+      else if(!sttSupported){
+        showAlert('本地识别服务不可用，当前浏览器也不支持语音识别，请直接打字回答', 'error');
+      } else {
+        legacyStartListening();
+      }
+    });
+    return;
+  }
+  if(!sttSupported){
+    showAlert('当前浏览器不支持语音识别（SpeechRecognition），请用 Chrome / Edge，或直接打字回答', 'error');
+    return;
+  }
+  legacyStartListening();
+}
+
+/* 浏览器 SpeechRecognition 回退路径（线上 / 无本地服务时使用） */
+function legacyStartListening(){
   stopAudio();
   pendingText = '';
   recog = new SR();
@@ -1091,10 +1208,14 @@ function startListening(){
   }, 2500);
 }
 
-function stopListening(){ if(recog){ try{ recog.abort(); }catch(e){} } }
+function stopListening(){
+  if(mrActive) stopLocalRec();
+  if(recog){ try{ recog.abort(); }catch(e){} }
+}
 
 micBtn.addEventListener('click', () => {
   if(recogActive){ stopListening(); return; }
+  if(mrActive){ stopLocalRec(); return; }
   if(ended){
     showAlert('本轮已经结束，点「换一位敲门人」或「再练一次」继续', 'info');
     return;
